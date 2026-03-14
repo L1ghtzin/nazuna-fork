@@ -152,7 +152,10 @@ async function initializeSubBot(botId, phoneNumber, ownerNumber, generatePairing
         const { state, saveCreds } = await useMultiFileAuthState(dirs.authDir, makeCacheableSignalKeyStore);
         const version = [2, 3000, 1031821793];
 
-        const msgRetryCounterCache = new NodeCache();
+        const msgRetryCounterCache = new NodeCache({ stdTTL: 5 * 60, useClones: false });
+        const mediaCache = new NodeCache({ stdTTL: 30 * 60, useClones: false, maxKeys: 200 });
+        const userDevicesCache = new NodeCache({ stdTTL: 5 * 60, useClones: false, maxKeys: 1000 });
+        const callOfferCache = new NodeCache({ stdTTL: 5 * 60, useClones: false, maxKeys: 100 });
 
         const sock = makeWASocket({
             version,
@@ -169,6 +172,9 @@ async function initializeSubBot(botId, phoneNumber, ownerNumber, generatePairing
             keepAliveIntervalMs: 30_000,
             defaultQueryTimeoutMs: undefined,
             msgRetryCounterCache,
+            mediaCache,
+            userDevicesCache,
+            callOfferCache,
             auth: state,
             shouldResendMessageOn475AckError: true
         });

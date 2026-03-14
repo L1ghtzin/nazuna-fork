@@ -2,10 +2,13 @@ import NodeCache from 'node-cache';
 import path from 'path';
 import zlib from 'zlib';
 
+// Caches quentes que nao devem usar compressao (alto throughput, baixa latencia)
+const HOT_CACHES = new Set(['msgRetry', 'messages', 'commands', 'indexGroupMeta']);
+
 class OptimizedCacheManager {
     constructor() {
         this.caches = new Map();
-        this.memoryThreshold = 0.95; // 95% da memória disponível
+        this.memoryThreshold = 0.85; // 85% da memória disponível
         this.cleanupInterval = 5 * 60 * 1000; // 5 minutos
         this.compressionEnabled = true;
         this.isOptimizing = false;
@@ -20,76 +23,32 @@ class OptimizedCacheManager {
      * Inicializa os caches com configurações otimizadas
      */
     initializeCaches() {
-        // Cache para retry de mensagens (menor TTL, mais eficiente)
-        this.caches.set('msgRetry', new NodeCache({
-            stdTTL: 2 * 60, // 2 minutos (reduzido de 5)
-            checkperiod: 30, // Verifica a cada 30 segundos
-            useClones: false,
-            maxKeys: 1000, // Limita número de chaves
-            deleteOnExpire: true,
-            forceString: false
-        }));
+        const cacheConfigs = [
+            ['msgRetry', { stdTTL: 2 * 60, checkperiod: 30, maxKeys: 1000 }],
+            ['groupMeta', { stdTTL: 10 * 60, checkperiod: 2 * 60, maxKeys: 500 }],
+            ['indexGroupMeta', { stdTTL: 10, checkperiod: 30, maxKeys: 500 }],
+            ['messages', { stdTTL: 60, checkperiod: 15, maxKeys: 2000 }],
+            ['userData', { stdTTL: 30 * 60, checkperiod: 5 * 60, maxKeys: 2000 }],
+            ['commands', { stdTTL: 5 * 60, checkperiod: 60, maxKeys: 5000 }],
+            ['media', { stdTTL: 30, checkperiod: 10, maxKeys: 100 }],
+        ];
 
-        // Cache para metadados de grupos (TTL maior, dados mais estáveis)
-        this.caches.set('groupMeta', new NodeCache({
-            stdTTL: 10 * 60, // 10 minutos
-            checkperiod: 2 * 60, // Verifica a cada 2 minutos
-            useClones: false,
-            maxKeys: 500, // Máximo 500 grupos
-            deleteOnExpire: true,
-            forceString: false
-        }));
+        for (const [name, opts] of cacheConfigs) {
+            const cache = new NodeCache({
+                ...opts,
+                useClones: false,
+                deleteOnExpire: true,
+                forceString: false
+            });
 
-        // Cache para metadados de grupos específico do index.js (TTL de 10 segundos)
-        this.caches.set('indexGroupMeta', new NodeCache({
-            stdTTL: 10, // 10 segundos
-            checkperiod: 30, // Verifica a cada 30 segundos
-            useClones: false,
-            maxKeys: 500, // Máximo 500 grupos
-            deleteOnExpire: true,
-            forceString: false
-        }));
+            // Limpa lruOrder/accessCounts quando chaves expiram para evitar memory leak
+            cache.on('expired', (key) => {
+                this.lruOrder.delete(key);
+                this.accessCounts.delete(key);
+            });
 
-        // Cache para mensagens recentes (para anti-delete)
-        this.caches.set('messages', new NodeCache({
-            stdTTL: 60, // 1 minuto apenas
-            checkperiod: 15, // Verifica a cada 15 segundos
-            useClones: false,
-            maxKeys: 2000, // Máximo 2000 mensagens
-            deleteOnExpire: true,
-            forceString: false
-        }));
-
-        // Cache para dados de usuários (sessões, permissões)
-        this.caches.set('userData', new NodeCache({
-            stdTTL: 30 * 60, // 30 minutos
-            checkperiod: 5 * 60, // Verifica a cada 5 minutos
-            useClones: false,
-            maxKeys: 2000,
-            deleteOnExpire: true,
-            forceString: false
-        }));
-
-        // Cache para comandos e rate limiting
-        this.caches.set('commands', new NodeCache({
-            stdTTL: 5 * 60, // 5 minutos
-            checkperiod: 60, // Verifica a cada minuto
-            useClones: false,
-            maxKeys: 5000,
-            deleteOnExpire: true,
-            forceString: false
-        }));
-
-        // Cache para mídia temporária (TTL muito baixo)
-        this.caches.set('media', new NodeCache({
-            stdTTL: 30, // 30 segundos apenas
-            checkperiod: 10, // Verifica a cada 10 segundos
-            useClones: false,
-            maxKeys: 100, // Poucos itens de mídia
-            deleteOnExpire: true,
-            forceString: false
-        }));
-
+            this.caches.set(name, cache);
+        }
     }
 
     /**
@@ -125,8 +84,8 @@ class OptimizedCacheManager {
 
             let finalValue = value;
 
-            // Comprime dados grandes se habilitado
-            if (this.compressionEnabled && this.shouldCompress(value)) {
+            // Comprime dados grandes se habilitado (apenas para caches frios)
+            if (this.compressionEnabled && !HOT_CACHES.has(cacheType) && this.shouldCompress(value)) {
                 finalValue = await this.compressData(value);
             }
 
@@ -208,7 +167,11 @@ class OptimizedCacheManager {
     clear(cacheType) {
         const cache = this.caches.get(cacheType);
         if (cache) {
-            const keysCount = cache.keys().length;
+            // Limpa entradas auxiliares de LRU/access para chaves deste cache
+            for (const key of cache.keys()) {
+                this.lruOrder.delete(key);
+                this.accessCounts.delete(key);
+            }
             cache.flushAll();
             return true;
         }
@@ -296,9 +259,9 @@ class OptimizedCacheManager {
             
             const memoryPercentage = memUsage.heapUsed / memUsage.heapTotal;
 
-            if (memoryPercentage > 1024) {
+            if (memoryPercentage > this.memoryThreshold) {
                 await this.optimizeMemory('high_memory_usage');
-            } else if (usedMB > 300) {
+            } else if (memoryPercentage > 0.7) {
                 await this.optimizeMemory('moderate_memory_usage');
             }
 
@@ -335,7 +298,7 @@ class OptimizedCacheManager {
                             await this.removeOldCacheItems(cache, 0.5);
                         }
                     } else {
-                        cache.flushAll();
+                        // Uso moderado: remove apenas 20% dos itens mais antigos
                         await this.removeOldCacheItems(cache, 0.2);
                     }
                 }
@@ -442,16 +405,17 @@ class OptimizedCacheManager {
      * Força limpeza de todos os caches
      */
     forceCleanup() {
-        
         for (const [type, cache] of this.caches) {
-            const keysCount = cache.keys().length;
             cache.flushAll();
         }
+
+        // Limpa Maps auxiliares por completo
+        this.lruOrder.clear();
+        this.accessCounts.clear();
 
         if (global.gc) {
             global.gc();
         }
-
     }
 
     /**
