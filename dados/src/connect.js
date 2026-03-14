@@ -1375,9 +1375,8 @@ async function createBotSocket(authDir) {
                 console.log(`❌ Conexão fechada. Código: ${reason} | Motivo: ${reasonMessage}`);
                 
                 // Limpa recursos antes de reconectar
-                if (cacheCleanupInterval) {
-                    clearInterval(cacheCleanupInterval);
-                    cacheCleanupInterval = null;
+                if (messagesCache) {
+                    messagesCache.clear();
                 }
                 
                 // Tratamento especial para erro 403 (Forbidden)
@@ -1535,10 +1534,9 @@ async function gracefulShutdown(signal) {
             console.error('❌ Erro ao desconectar sub-bots:', error.message);
         }
         
-        // Limpa recursos
-        if (cacheCleanupInterval) {
-            clearInterval(cacheCleanupInterval);
-            cacheCleanupInterval = null;
+        // Limpa caches
+        if (messagesCache) {
+            messagesCache.clear();
         }
         
         // Finaliza fila de mensagens
