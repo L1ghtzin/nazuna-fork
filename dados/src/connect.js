@@ -304,6 +304,82 @@ const GLOBAL_BLACKLIST_PATH = path.join(__dirname, '..', 'database', 'dono', 'gl
 
 let msgRetryCounterCache;
 let messagesCache;
+let mediaCache;
+let userDevicesCache;
+let callOfferCache;
+
+// TTLs padrão do Baileys (em segundos)
+const DEFAULT_CACHE_TTLS = {
+    SIGNAL_STORE: 5 * 60,
+    MSG_RETRY: 60 * 60,
+    CALL_OFFER: 5 * 60,
+    USER_DEVICES: 5 * 60,
+    MEDIA: 30 * 60,
+    MESSAGES: 5 * 60,
+};
+
+function createBaileysCache(stdTTL, maxKeys = -1) {
+    const opts = { stdTTL, useClones: false, deleteOnExpire: true };
+    if (maxKeys > 0) opts.maxKeys = maxKeys;
+    return new NodeCache(opts);
+}
+
+/**
+ * Wrapper que fornece interface compatível com Map sobre NodeCache.
+ * Permite que código existente (index.js) que usa .size, .values(), .clear()
+ * funcione sem alterações, enquanto ganha TTL e maxKeys do NodeCache.
+ */
+class MapCompatibleCache {
+    constructor(stdTTL, maxKeys) {
+        this._cache = createBaileysCache(stdTTL, maxKeys);
+    }
+
+    get size() {
+        return this._cache.keys().length;
+    }
+
+    get(key) {
+        return this._cache.get(key);
+    }
+
+    set(key, value, ttl) {
+        if (ttl !== undefined) {
+            return this._cache.set(key, value, ttl);
+        }
+        return this._cache.set(key, value);
+    }
+
+    has(key) {
+        return this._cache.has(key);
+    }
+
+    delete(key) {
+        return this._cache.del(key) > 0;
+    }
+
+    del(key) {
+        return this._cache.del(key);
+    }
+
+    keys() {
+        return this._cache.keys();
+    }
+
+    *values() {
+        for (const key of this._cache.keys()) {
+            const val = this._cache.get(key);
+            if (val !== undefined) yield val;
+        }
+    }
+
+    clear() {
+        this._cache.flushAll();
+    }
+
+    flushAll() {
+        this._cache.flushAll();
+    }
+}
 
 async function initializeOptimizedCaches() {
     try {
@@ -318,8 +394,6 @@ async function initializeOptimizedCaches() {
             del: (key) => performanceOptimizer.modules.cacheManager?.del('msgRetry', key)
         };
         
-        messagesCache = new Map();
-        
     } catch (error) {
         console.error('❌ Erro ao inicializar sistema de otimização:', error.message);
         
@@ -327,32 +401,18 @@ async function initializeOptimizedCaches() {
             stdTTL: 5 * 60,
             useClones: false
         });
-        messagesCache = new Map();
-        
     }
+
+    // Caches do Baileys SocketConfig (independentes do performanceOptimizer)
+    messagesCache = new MapCompatibleCache(DEFAULT_CACHE_TTLS.MESSAGES, 3000);
+    mediaCache = createBaileysCache(DEFAULT_CACHE_TTLS.MEDIA, 200);
+    userDevicesCache = createBaileysCache(DEFAULT_CACHE_TTLS.USER_DEVICES, 1000);
+    callOfferCache = createBaileysCache(DEFAULT_CACHE_TTLS.CALL_OFFER, 100);
 }
 const codeMode = process.argv.includes('--code') || process.env.NAZUNA_CODE_MODE === '1';
 
-// Cleanup otimizado do cache de mensagens
-let cacheCleanupInterval = null;
-const setupMessagesCacheCleanup = () => {
-    if (cacheCleanupInterval) clearInterval(cacheCleanupInterval);
-    
-    cacheCleanupInterval = setInterval(() => {
-        if (!messagesCache || messagesCache.size <= 3000) return;
-        
-        const keysToDelete = Math.floor(messagesCache.size * 0.4); // Remove 40% dos mais antigos
-        const keys = Array.from(messagesCache.keys()).slice(0, keysToDelete);
-        keys.forEach(key => messagesCache.delete(key));
-        
-        console.log(`🧹 Cache limpo: ${keysToDelete} mensagens removidas (total: ${messagesCache.size})`);
-    }, 300000); // A cada 5 minutos
-};
-
-// Inicia cleanup quando o bot conectar
-const startCacheCleanup = () => {
-    setupMessagesCacheCleanup();
-};
+// NodeCache gerencia TTL e maxKeys automaticamente, nao precisa de cleanup manual
+const startCacheCleanup = () => {};
 
 const ask = (question) => {
     const rl = readline.createInterface({
@@ -1044,6 +1104,9 @@ async function createBotSocket(authDir) {
             defaultQueryTimeoutMs: undefined,
             browser: ['Windows', 'Edge', '143.0.3650.66'],
             msgRetryCounterCache,
+            mediaCache,
+            userDevicesCache,
+            callOfferCache,
             auth: state,
             signalRepository,
             logger
@@ -1174,9 +1237,8 @@ async function createBotSocket(authDir) {
             
             // Cache da mensagem para uso posterior no processamento (anti-delete, resumirchat, etc)
             if (messagesCache && info.key?.id && info.key?.remoteJid) {
-                // Chave composta: remoteJid_messageId para permitir filtrar por grupo
                 const cacheKey = `${info.key.remoteJid}_${info.key.id}`;
-                messagesCache.set(cacheKey, info);
+                messagesCache.set(cacheKey, info, DEFAULT_CACHE_TTLS.MESSAGES);
             }
             
             // Processa mensagem
@@ -1313,9 +1375,8 @@ async function createBotSocket(authDir) {
                 console.log(`❌ Conexão fechada. Código: ${reason} | Motivo: ${reasonMessage}`);
                 
                 // Limpa recursos antes de reconectar
-                if (cacheCleanupInterval) {
-                    clearInterval(cacheCleanupInterval);
-                    cacheCleanupInterval = null;
+                if (messagesCache) {
+                    messagesCache.clear();
                 }
                 
                 // Tratamento especial para erro 403 (Forbidden)
@@ -1473,10 +1534,9 @@ async function gracefulShutdown(signal) {
             console.error('❌ Erro ao desconectar sub-bots:', error.message);
         }
         
-        // Limpa recursos
-        if (cacheCleanupInterval) {
-            clearInterval(cacheCleanupInterval);
-            cacheCleanupInterval = null;
+        // Limpa caches
+        if (messagesCache) {
+            messagesCache.clear();
         }
         
         // Finaliza fila de mensagens
